@@ -1,0 +1,8 @@
+_command.sh
+_remindme.md
+venv/
+qat/
+.terraform/
+.terraform.lock.hcl
+terraform.tfstate.backup
+terraform.tfstate
