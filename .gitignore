@@ -6,3 +6,6 @@ qat/
 .terraform.lock.hcl
 terraform.tfstate.backup
 terraform.tfstate
+cloudformation/
+.$architecture.drawio.bkp
+architecture.drawio

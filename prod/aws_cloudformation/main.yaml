@@ -1,0 +1,547 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Parameters:
+  ResoucePrefix:
+    Type: String
+    Default: "nl-ec2-inspector"
+    Description: "Tag to filter EC2 instances"
+
+  ScheduleExpression:
+    Type: String
+    Default: "cron(0/30 22-8 ? * * *)"
+    Description: "EventBridge schedule expression for Trigering Lambda function"
+
+  TimeZone:
+    Type: String
+    Default: "Asia/Taipei"
+    Description: "Time zone for the schedule expression"
+
+  EmailEndpoint1:
+    Type: String
+    Description: Primary Email Endpoint for SNS Subscription
+    Default: ""
+  
+  EmailEndpoint2:
+    Type: String
+    Description: Second Email Endpoint for SNS Subscription
+    Default: ""
+  
+  EmailEndpoint3:
+    Type: String
+    Description: Third Email Endpoint for SNS Subscription
+    Default: ""
+  
+
+
+Resources:
+# ---Eventbridge-----------------------------------------------------------------------
+  EventBridgeSchedule:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      Name: !Sub ${ResoucePrefix}-scheduler
+      Description: "Check EC2 instances base on cron job"
+      ScheduleExpressionTimezone: !Ref TimeZone
+      ScheduleExpression: !Ref ScheduleExpression
+      State: "ENABLED"
+      FlexibleTimeWindow:
+        Mode: "OFF"
+      Target:
+        Arn: !GetAtt LambdaCloudwatchmetricinspector.Arn
+        RoleArn: !GetAtt EventBridgeRole.Arn
+
+  EventBridgeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: scheduler.amazonaws.com
+            Action: sts:AssumeRole
+
+      Policies:
+        - PolicyName: InvokeLambdaPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: 
+                  - !Sub "${LambdaCloudwatchmetricinspector.Arn}:*"
+                  - !GetAtt LambdaCloudwatchmetricinspector.Arn
+
+
+# -API Gateway---------------------------------------------------------------------
+  EC2AutoTerminationApi:
+    Type: 'AWS::ApiGateway::RestApi'
+    Properties:
+      Name: !Sub ${ResoucePrefix}-ec2-auto-termination-api
+      Description: 'API Gateway for stopping high CPU EC2 instances'
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+
+  StopResource:
+    Type: 'AWS::ApiGateway::Resource'
+    DependsOn: EC2AutoTerminationApi
+    Properties:
+      RestApiId: !Ref EC2AutoTerminationApi
+      ParentId: !GetAtt EC2AutoTerminationApi.RootResourceId
+      PathPart: 'stop'
+
+  RegionResource:
+    Type: AWS::ApiGateway::Resource
+    DependsOn: StopResource
+    Properties:
+      RestApiId: !Ref EC2AutoTerminationApi
+      ParentId: !Ref StopResource
+      PathPart: "{region}"
+
+  InstanceIDResource:
+    Type: AWS::ApiGateway::Resource
+    DependsOn: RegionResource
+    Properties:
+      RestApiId: !Ref EC2AutoTerminationApi
+      ParentId: !Ref RegionResource
+      PathPart: "{instance_id}"
+
+  StopApiMethod:
+    Type: 'AWS::ApiGateway::Method'
+    Properties:
+      RestApiId: !Ref EC2AutoTerminationApi
+      ResourceId: !Ref StopResource
+      HttpMethod: GET
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+        IntegrationResponses:
+          - StatusCode: "200"
+      MethodResponses:
+        - StatusCode: "200"
+
+  RegionMethod:
+    Type: AWS::ApiGateway::Method
+    DependsOn: StopApiMethod
+    Properties:
+      RestApiId: !Ref EC2AutoTerminationApi
+      ResourceId: !Ref RegionResource
+      HttpMethod: GET
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+        IntegrationResponses:
+          - StatusCode: "200"
+      MethodResponses:
+        - StatusCode: "200"
+
+  InstanceIDApiMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref EC2AutoTerminationApi
+      ResourceId: !Ref InstanceIDResource
+      HttpMethod: GET
+      AuthorizationType: NONE
+      RequestParameters:
+        method.request.path.instance_id: true
+      Integration:
+        Type: AWS
+        IntegrationHttpMethod: POST
+        Uri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${LambdaStopInstance.Arn}/invocations"
+        Credentials: !GetAtt ApiGatewayRole.Arn
+        RequestTemplates:
+          application/json: |
+            {
+              "region": "$input.params('region')",
+              "instance_ids": ["$input.params('instance_id')"]
+            }
+        IntegrationResponses:
+          - StatusCode: "200"
+            ResponseTemplates: 
+              "application/json": "$input.json('$.body')"
+          - StatusCode: "400"
+            ResponseTemplates: 
+              "application/json": "$input.json('$.body')"
+      MethodResponses:
+        - StatusCode: '200'
+          ResponseModels: 
+            "application/json": !Ref InstanceIdsModel
+        - StatusCode: '400'
+          ResponseModels:
+            application/json: !Ref InstanceIdsModel
+
+  InstanceIdsModel:
+    Type: AWS::ApiGateway::Model
+    Properties:
+      RestApiId: !Ref EC2AutoTerminationApi
+      ContentType: application/json
+      Description: Schema for instance IDs response
+      Schema:
+        type: object
+        required:
+          - instance_ids
+        properties:
+          instance_ids:
+            type: array
+            items:
+              type: string
+              description: EC2 實例 ID
+            description: 要停止的實例 ID 陣列
+
+  ApiGatewayDeployment:
+    Type: 'AWS::ApiGateway::Deployment'
+    DependsOn: 
+      - InstanceIDApiMethod
+    Properties:
+      RestApiId: !Ref EC2AutoTerminationApi
+
+  ApiGatewayStage:
+    Type: 'AWS::ApiGateway::Stage'
+    DependsOn: ApiGatewayDeployment
+    Properties:
+      DeploymentId: !Ref ApiGatewayDeployment
+      RestApiId: !Ref EC2AutoTerminationApi
+      StageName: 'prod'
+
+  ApiGatewayRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: apigateway.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AmazonAPIGatewayPushToCloudWatchLogs'
+      Policies:
+        - PolicyName: LambdaInvokePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'lambda:InvokeFunction'
+                  - 'ec2:CreateTags'
+                Resource:
+                  - !GetAtt LambdaStopInstance.Arn
+                  - '*'
+                  
+# ---Lambda----------------------------------------------------------
+  LambdaCloudwatchmetricinspector:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub ${ResoucePrefix}-lambda-cloudwatch-inspector
+      Handler: index.lambda_handler
+      Runtime: python3.13
+      MemorySize: 128
+      Timeout: 60
+      Code:
+        ZipFile: |
+          import boto3
+          import os
+          from datetime import datetime, timedelta
+
+          api_url = os.environ['API_URL']
+          sns_topic = os.environ['SNS_TOPIC']
+
+          def lambda_handler(event, context):
+              regions = [r['RegionName'] for r in boto3.client('ec2').describe_regions()['Regions']]
+              sns = boto3.client('sns')
+              threshold = 0.1
+              Low_cpu_instances = []
+
+              for region in regions:
+                  print(f"Checking region: {region}")
+                  ec2 = boto3.client('ec2', region_name=region)
+                  cw = boto3.client('cloudwatch', region_name=region)
+
+                  ids = [
+                      i['InstanceId']
+                      for r in ec2.describe_instances(Filters=[
+                          {'Name': 'tag:AutoStop', 'Values': ['true']},
+                          {'Name': 'instance-state-name', 'Values': ['running']}
+                      ])['Reservations']
+                      for i in r['Instances']
+                  ]
+
+                  if not ids:
+                      print(f"No AutoStop instances running in {region}")
+                      continue
+
+                  print(f"Instances to check in {region}:", ids)
+                  now = datetime.utcnow()
+                  start = now - timedelta(minutes=15)
+
+                  for instance_id in ids:
+                      info = ec2.describe_instances(InstanceIds=[instance_id])['Reservations'][0]['Instances'][0]
+                      itype = info['InstanceType']
+                      iname = next((tag['Value'] for tag in info.get('Tags', []) if tag['Key'] == 'Name'), 'No Name')
+
+                      dpts = cw.get_metric_statistics(
+                          Namespace='AWS/EC2',
+                          MetricName='CPUUtilization',
+                          Dimensions=[{'Name': 'InstanceId', 'Value': instance_id}],
+                          StartTime=start,
+                          EndTime=now,
+                          Period=900,
+                          Statistics=['Average']
+                      )['Datapoints']
+
+                      if not dpts:
+                          print(f"{instance_id} No metrics data")
+                          continue
+
+                      for d in dpts:
+                          if d['Average'] < threshold:
+                              Low_cpu_instances.append({
+                                  'instance_id': instance_id,
+                                  'cpu': round(d['Average'], 2),
+                                  'instance_type': itype,
+                                  'instance_name': iname,
+                                  'timestamp': d['Timestamp'],
+                                  'region': region
+                              })
+                              print(f"{instance_id} CPU usage {round(d['Average'], 2)} at {d['Timestamp']} below threshold {threshold}")
+                              break
+                      else:
+                          print(f"{instance_id} Below threshold")
+
+              if Low_cpu_instances:
+                  try:
+                      details = "\n".join([
+                          f"\n• Instance ---{i['instance_name']} ({i['instance_type']})---"
+                          f"\n  - ID: {i['instance_id']}"
+                          f"\n  - Region: {i['region']}"
+                          f"\n  - CPU Usage: {i['cpu'] * 100}%"
+                          f"\n  - Stop Instance Link: {api_url}/stop/{i['region']}/{i['instance_id']}"
+                          for i in Low_cpu_instances
+                      ])
+
+                      msg = f"""
+          Warning: Low CPU Usage Detected
+          ---------------------------------------------------------
+
+          {details}
+
+          ---------------------------------------------------------
+          *Threshold: {threshold * 100}%
+          *Check Time: {datetime.utcnow()}
+                      """
+
+                      sns.publish(
+                          TopicArn=sns_topic,
+                          Message=msg,
+                          Subject=f'EC2 Instance Low CPU Alert - {len(Low_cpu_instances)} instances affected'
+                      )
+                      print(f"Notification sent for {len(Low_cpu_instances)} instances")
+
+                  except Exception as e:
+                      print(f"Error sending notification: {e}")
+
+              print("------------------------------------------------")
+              return {'statusCode': 200, 'body': 'Processing complete'}
+
+      Environment:
+        Variables:
+          API_URL: !Sub 'https://${EC2AutoTerminationApi}.execute-api.${AWS::Region}.amazonaws.com/prod'
+          SNS_TOPIC: !Ref SNSTopic
+      Role: !GetAtt LambdaExecutionRole.Arn
+
+  LambdaStopInstance:
+    Type: AWS::Lambda::Function
+    
+    Properties:
+      FunctionName: !Sub ${ResoucePrefix}-lambda-stop-instance
+      Handler: index.lambda_handler
+      Runtime: python3.13
+      MemorySize: 128
+      Timeout: 60
+      Code:
+        ZipFile: |
+          import boto3
+          from botocore.exceptions import ClientError, BotoCoreError
+          import json
+
+          event = {
+            "region": "ap-northeast-1",
+            "instance_ids": ["i-032163faca41c7531"]
+          }
+
+          def lambda_handler(event, context):
+              try:
+                  region = event.get('region')
+                  if not region:
+                      return {
+                          'statusCode': 400,
+                          'body': json.dumps({
+                              'message': 'No region provided',
+                              'instances': None,
+                              'event': event
+                          })
+                      }
+
+                  ec2 = boto3.client('ec2', region_name=region)
+                  print("階段一：從 API 接收 Instance IDs 和 Region")
+
+                  instance_ids = event.get('instance_ids')
+
+                  if not instance_ids:
+                      return {
+                          'statusCode': 400,
+                          'body': json.dumps({
+                              'message': 'No instance IDs provided',
+                              'instances': None,
+                              'event': event
+                          })
+                      }
+
+                  instance_ids = list(instance_ids) if isinstance(instance_ids, set) else instance_ids
+                  
+                  print(f"階段二：收到的 EC2 IDs：{instance_ids}")
+                  
+                  ec2_resource = boto3.resource('ec2', region_name=region)
+                  
+                  stopped_instances = []
+                  failed_instances = []
+
+                  for instance_id in instance_ids:
+                      print(f"Checking if instance {instance_id} exists...")
+                      instance = ec2_resource.Instance(instance_id)
+
+                      try:
+                          instance.load()  # This will fail if instance doesn't exist
+                          print(f"階段三：開始更新 {instance_id} 的 tag：instance-state-name => stop")
+                          instance.create_tags(Tags=[{'Key': 'instance-state-name', 'Value': 'stop'}])
+
+                          print(f"階段四：開始停止 EC2 {instance_id}")
+                          ec2.stop_instances(InstanceIds=[instance_id])
+                          stopped_instances.append(instance_id)
+
+                      except ClientError as e:
+                          if e.response['Error']['Code'] == 'InvalidInstanceID.NotFound':
+                              print(f"Instance {instance_id} not found")
+                              failed_instances.append({'id': instance_id, 'error': 'Instance not found'})
+                          else:
+                              print(f"Error with instance {instance_id}: {str(e)}")
+                              failed_instances.append({'id': instance_id, 'error': str(e)})
+
+                      except BotoCoreError as e:
+                          print(f"BotoCore error with instance {instance_id}: {str(e)}")
+                          failed_instances.append({'id': instance_id, 'error': str(e)})
+
+                  print("階段五：停止命令已全部發出")
+
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'message': 'EC2 stop operation completed',
+                          'stopped_instances': stopped_instances,
+                          'failed_instances': failed_instances
+                      })
+                  }
+
+              except Exception as e:
+                  return {
+                      'statusCode': 400,
+                      'body': json.dumps({
+                          'message': 'EC2 stop operation completed',
+                          'stopped_instances': stopped_instances,
+                          'failed_instances': failed_instances
+                      })
+                  }
+
+
+      Role: !GetAtt LambdaExecutionRole.Arn
+
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: LambdaCWInspectorPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                - 'ec2:DescribeInstances'
+                - 'ec2:DescribeInstanceTypes'
+                - 'ec2:StopInstances'
+                - 'ec2:CreateTags'
+                - 'ec2:DescribeRegions'
+                - 'cloudwatch:GetMetricData'
+                - 'cloudwatch:GetMetricStatistics'
+                - 'sns:Publish'
+                Resource: '*'
+
+# ---SNS-------------------------------------------------------------
+  SNSTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub ${ResoucePrefix}-topic
+
+  SNSSubscription1:
+    Type: AWS::SNS::Subscription
+    Condition: HasEmail1
+    Properties:
+      Protocol: email
+      Endpoint: !Ref EmailEndpoint1
+      TopicArn: !Ref SNSTopic
+
+  SNSSubscription2:
+    Type: AWS::SNS::Subscription
+    Condition: HasEmail2
+    Properties:
+      Protocol: email
+      Endpoint: !Ref EmailEndpoint2
+      TopicArn: !Ref SNSTopic
+
+  SNSSubscription3:
+    Type: AWS::SNS::Subscription
+    Condition: HasEmail3
+    Properties:
+      Protocol: email
+      Endpoint: !Ref EmailEndpoint3
+      TopicArn: !Ref SNSTopic
+
+Conditions:
+  HasEmail1: !Not [!Equals [!Ref EmailEndpoint1, ""]]
+  HasEmail2: !Not [!Equals [!Ref EmailEndpoint2, ""]]
+  HasEmail3: !Not [!Equals [!Ref EmailEndpoint3, ""]]
+
+# -OUTPUT---------------------------------------------------------------------
+Outputs:
+  TopicArn:
+    Description: The ARN of the SNS topic
+    Value: !Ref SNSTopic
+  
+  ApiGatewayStopEC2URL:
+    Description: 'API Gateway endpoint URL od Stop EC2 instances ({instance_id} need to be replaced)'
+    Value: !Sub 'https://${EC2AutoTerminationApi}.execute-api.${AWS::Region}.amazonaws.com/prod/{instance_id}'
+
+  LambdaCloudwatchmetricinspector:
+    Description: 'Lambda function for CloudWatch metric inspection'
+    Value: !GetAtt LambdaCloudwatchmetricinspector.Arn
+
+  LambdaStopInstance:
+    Description: 'Lambda function for stopping EC2 instances'
+    Value: !GetAtt LambdaStopInstance.Arn
+
+  EventBridgeSchedule:
+    Description: 'EventBridge schedule for Lambda function'
+    Value: !Ref EventBridgeSchedule
+
+
