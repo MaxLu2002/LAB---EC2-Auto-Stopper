@@ -19,7 +19,7 @@ def lambda_handler(event, context):
         ids = [
             i['InstanceId']
             for r in ec2.describe_instances(Filters=[
-                {'Name': 'tag:AutoStop', 'Values': ['true']},
+                {'Name': 'AutoStop', 'Values': ['true']},
                 {'Name': 'instance-state-name', 'Values': ['running']}
             ])['Reservations']
             for i in r['Instances']

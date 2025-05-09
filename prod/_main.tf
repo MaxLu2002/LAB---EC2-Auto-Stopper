@@ -1,10 +1,10 @@
-# module "s3" {
-#   source = "./modules/s3/"
+module "s3" {
+  source = "./modules/s3/"
 
-#   region       = var.region
-#   bucket_count = var.bucket_count
-#   tags         = var.tags
-# }
+  region       = var.region
+  bucket_count = var.bucket_count
+  tags         = var.tags
+}
 
 
 
