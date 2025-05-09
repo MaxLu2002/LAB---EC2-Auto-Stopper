@@ -1,5 +1,5 @@
 # EC2_Auto-Stopper
-## About this repo.
+## About This Repository
 This repository provides a solution for automatically stopping underutilized EC2 instances during non-working hours (e.g., 20:00 to 08:00). The goal is to address the issue of low utilization, which is defined in this lab as 10% CPU usage. The solution leverages AWS EventBridge to trigger a Lambda function based on a cron schedule. The Lambda function scans for EC2 instances that meet specific tag policies and low CPU utilization criteria. Once identified, the solution sends an email notification to the user, providing an API link to easily stop the underutilized EC2 instances. This approach ensures efficient resource management and cost optimization while offering users a simple way to take action through the provided email notifications.
 
 ![Architecture Diagram](image/architecture.png)
